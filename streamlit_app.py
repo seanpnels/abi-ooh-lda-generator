@@ -27,15 +27,9 @@ CATEGORY_KEYS = {
 }
 
 st.set_page_config(page_title='ABI OOH · LDA Coverage Generator', page_icon='🗺️', layout='wide')
-st.markdown('''<style>
-.block-container{max-width:1120px;padding-top:2rem}
-.abi-eyebrow{color:#52d9cd;letter-spacing:.16em;font-size:.8rem;font-weight:700}
-.abi-sub{color:#a3bdc8;font-size:.95rem}
-.abi-note{border:1px solid #345163;border-radius:12px;padding:14px;background:#112432}
-</style>''', unsafe_allow_html=True)
-st.markdown('<div class="abi-eyebrow">ABI OOH · GEOGRAPHIC COVERAGE</div>', unsafe_allow_html=True)
-st.title('LDA Restricted-Area Generator')
-st.markdown('<div class="abi-sub">Public OpenStreetMap data only. No proprietary placement uploads, no accounts, no Google Drive access.</div>', unsafe_allow_html=True)
+st.caption("ABI OOH · GEOGRAPHIC COVERAGE")
+st.title("LDA Restricted-Area Generator")
+st.write("Public OpenStreetMap data only. No proprietary placement uploads, no accounts, no Google Drive access.")
 
 @st.cache_data(ttl=86400, show_spinner='Loading the 209 DMA boundaries…')
 def load_markets():
@@ -173,12 +167,21 @@ def generate(feature,feet,progress):
     progress.info(f'Packaging {len(buffers):,} restricted areas into Google Earth KMZ…')
     return kmz_bytes(name,dma_id,dma,buffers,feet,count),count
 
-try:
-    markets=load_markets()
-except Exception as exc:
-    st.error(f'Could not load DMA reference data: {exc}')
+st.caption("Web prototype v2 · Public geographic data only")
+st.info("App loaded successfully. Click **Load DMA markets** to fetch market boundaries. No geographic data is downloaded until you ask for it.")
+if st.button("Load DMA markets"):
+    with st.spinner("Loading the 209 DMA market boundaries…"):
+        try:
+            st.session_state["markets"] = load_markets()
+            st.session_state.pop("market_error", None)
+        except Exception as exc:
+            st.session_state["market_error"] = f"{type(exc).__name__}: {exc}"
+if "market_error" in st.session_state:
+    st.error(f"DMA reference data could not be loaded: {st.session_state['market_error']}")
+if "markets" not in st.session_state:
     st.stop()
-
+markets = st.session_state["markets"]
+st.success(f"{len(markets)} DMA markets loaded.")
 st.divider()
 left,right=st.columns([3,1])
 with left:
@@ -202,4 +205,4 @@ if 'result' in st.session_state:
     st.success(f'{name}: {count:,} mapped source features processed in {elapsed:,.1f} seconds.')
     filename=re.sub(r'[^a-zA-Z0-9_-]+','_',name).strip('_')
     st.download_button('⬇️ Download Google Earth KMZ',content,file_name=f'{filename}_{dist}ft_REVIEW_ONLY.kmz',mime='application/vnd.google-earth.kmz',type='primary')
-st.markdown('''<div class="abi-note"><strong>Preliminary screening only.</strong> OpenStreetMap may be incomplete or inaccurate. A missing red area does not establish legal clearance. This prototype uses public Overpass services, which may time out or reject large DMA queries. No proprietary grids are accepted or stored.</div>''',unsafe_allow_html=True)
+st.warning("Preliminary screening only. OpenStreetMap may be incomplete or inaccurate. A missing red area does not establish legal clearance. Public Overpass servers may time out or reject large DMA queries. No proprietary grids are accepted or stored.")
