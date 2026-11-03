@@ -1,5 +1,8 @@
 """ABI OOH public-data geographic coverage prototype. No inventory ingestion."""
 import io
+import os
+import uuid
+from pathlib import Path
 import json
 import re
 import time
@@ -31,7 +34,7 @@ st.caption("ABI OOH · GEOGRAPHIC COVERAGE")
 st.title("LDA Restricted-Area Generator")
 st.write("Public OpenStreetMap data only. No proprietary placement uploads, no accounts, no Google Drive access.")
 
-@st.cache_data(ttl=86400, show_spinner='Loading the 209 DMA boundaries…')
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_markets():
     features=[]; offset=0; seen=set()
     with requests.Session() as session:
@@ -167,42 +170,95 @@ def generate(feature,feet,progress):
     progress.info(f'Packaging {len(buffers):,} restricted areas into Google Earth KMZ…')
     return kmz_bytes(name,dma_id,dma,buffers,feet,count),count
 
-st.caption("Web prototype v2 · Public geographic data only")
-st.info("App loaded successfully. Click **Load DMA markets** to fetch market boundaries. No geographic data is downloaded until you ask for it.")
-if st.button("Load DMA markets"):
-    with st.spinner("Loading the 209 DMA market boundaries…"):
-        try:
-            st.session_state["markets"] = load_markets()
-            st.session_state.pop("market_error", None)
-        except Exception as exc:
-            st.session_state["market_error"] = f"{type(exc).__name__}: {exc}"
-if "market_error" in st.session_state:
-    st.error(f"DMA reference data could not be loaded: {st.session_state['market_error']}")
+st.caption("Web prototype v3 · Public geographic data only")
+st.info("Select **Load DMA markets** once. The 209 market boundaries are cached for subsequent sessions.")
 if "markets" not in st.session_state:
-    st.stop()
-markets = st.session_state["markets"]
-st.success(f"{len(markets)} DMA markets loaded.")
-st.divider()
-left,right=st.columns([3,1])
-with left:
-    chosen=st.selectbox('DMA market',markets,format_func=label,index=None,placeholder='Search the 209 DMA markets…')
-with right:
-    feet=st.selectbox('Restricted-area distance (feet)',[500,250],index=0)
-st.caption('Prototype: one DMA at a time. Multi-DMA and large-market tiling are not implemented yet.')
-if st.button('🗺️ Generate restricted-area KMZ',type='primary',disabled=chosen is None):
-    with st.status('Preparing geographic coverage…',expanded=True) as status:
+    if st.button("Load DMA markets", type="primary"):
         try:
-            start=time.monotonic()
-            output,count=generate(chosen,feet,st)
-            st.session_state['result']=(output,chosen['properties']['name'],feet,count,time.monotonic()-start)
-            status.update(label='KMZ generated successfully',state='complete',expanded=False)
+            with st.spinner("Fetching DMA boundaries…"):
+                st.session_state["markets"] = load_markets()
         except Exception as exc:
-            st.session_state.pop('result',None)
-            status.update(label='Generation failed — no file created',state='error',expanded=True)
-            st.error(f'{type(exc).__name__}: {exc}')
-if 'result' in st.session_state:
-    content,name,dist,count,elapsed=st.session_state['result']
-    st.success(f'{name}: {count:,} mapped source features processed in {elapsed:,.1f} seconds.')
-    filename=re.sub(r'[^a-zA-Z0-9_-]+','_',name).strip('_')
-    st.download_button('⬇️ Download Google Earth KMZ',content,file_name=f'{filename}_{dist}ft_REVIEW_ONLY.kmz',mime='application/vnd.google-earth.kmz',type='primary')
+            st.error(f"DMA reference data could not be loaded: {type(exc).__name__}: {exc}")
+    if "markets" not in st.session_state:
+        st.stop()
+
+markets = sorted(st.session_state["markets"], key=lambda f: (str(f["properties"].get("name","")).casefold(), str(f["properties"].get("ID",""))))
+st.caption(f"{len(markets)} DMA markets available · Alphabetically sorted")
+st.divider()
+left, right = st.columns([3,1])
+with left:
+    chosen = st.multiselect("DMA markets (select up to 5)", markets, format_func=label,
+        max_selections=5, placeholder="Search DMA markets alphabetically…")
+with right:
+    feet = st.selectbox("Restricted-area distance (feet)", [500,250], index=0)
+st.caption("Each DMA is processed separately. For multiple selections, the download is a ZIP containing one KMZ per DMA. Large markets may take several minutes each.")
+
+def safe_filename(name):
+    return re.sub(r"[^a-zA-Z0-9_-]+","_",name).strip("_")[:75] or "DMA"
+
+def store_recovery_file(payload, filename):
+    """Temporary server-side recovery link; available until Streamlit restarts/cleans storage."""
+    directory = Path(__file__).resolve().parent / "static"
+    directory.mkdir(parents=True, exist_ok=True)
+    # Do not retain unlimited temporary results.
+    import time as _time
+    for old in directory.glob("abi_*"):
+        try:
+            if _time.time() - old.stat().st_mtime > 86400:
+                old.unlink()
+        except OSError:
+            pass
+    token = uuid.uuid4().hex[:16]
+    path = directory / f"abi_{token}_{filename}"
+    tmp = directory / f".{path.name}.tmp"
+    tmp.write_bytes(payload)
+    os.replace(tmp, path)
+    return path.name
+
+if st.button("🗺️ Generate restricted-area files", type="primary", disabled=not chosen):
+    st.session_state.pop("result", None)
+    with st.status("Generating selected markets…", expanded=True) as status:
+        try:
+            start = time.monotonic()
+            outputs = []
+            for i, feature in enumerate(chosen, 1):
+                name = feature["properties"]["name"]
+                st.write(f"Market {i}/{len(chosen)}: {name}")
+                content, count = generate(feature, feet, st)
+                filename = f"{safe_filename(name)}_{feature['properties']['ID']}_{feet}ft_REVIEW_ONLY.kmz"
+                outputs.append((filename, content, count, name))
+                st.write(f"Completed {name}: {count:,} mapped features")
+            if len(outputs) == 1:
+                filename, payload = outputs[0][0], outputs[0][1]
+                mime = "application/vnd.google-earth.kmz"
+            else:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=2) as archive:
+                    for filename_i, content_i, _, _ in outputs:
+                        archive.writestr(filename_i, content_i)
+                    archive.writestr("README.txt", "Each KMZ is a separate DMA coverage layer. Load each KMZ into Google Earth. These are preliminary OpenStreetMap screening layers, NOT verified legal clearance.\\n")
+                payload = buf.getvalue()
+                filename = f"ABI_OOH_{len(outputs)}_DMAs_{feet}ft_REVIEW_ONLY.zip"
+                mime = "application/zip"
+            recovery = store_recovery_file(payload, filename)
+            st.session_state["result"] = {
+                "payload": payload, "filename": filename, "mime": mime,
+                "recovery": recovery, "markets": len(outputs),
+                "count": sum(o[2] for o in outputs),
+                "elapsed": time.monotonic()-start
+            }
+            status.update(label="Files generated successfully", state="complete", expanded=False)
+        except Exception as exc:
+            status.update(label="Generation failed — no complete download", state="error", expanded=True)
+            st.error(f"{type(exc).__name__}: {exc}")
+
+if "result" in st.session_state:
+    result = st.session_state["result"]
+    st.success(f"{result['markets']} DMA(s), {result['count']:,} source features, {result['elapsed']:,.1f} seconds.")
+    # Plain static URL is a fallback if the Streamlit download-button JS chunk fails.
+    st.markdown(f"**Direct recovery download:** [Download {result['filename']}](./app/static/{result['recovery']})")
+    st.caption("Recovery links are temporary, public, and may disappear after app restart or redeployment. Save your file locally.")
+    st.download_button("⬇️ Download file", data=result["payload"], file_name=result["filename"],
+        mime=result["mime"], type="primary", on_click="ignore")
+
 st.warning("Preliminary screening only. OpenStreetMap may be incomplete or inaccurate. A missing red area does not establish legal clearance. Public Overpass servers may time out or reject large DMA queries. No proprietary grids are accepted or stored.")
