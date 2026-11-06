@@ -1,4 +1,4 @@
-"""ABI OOH LDA Quick Check v5 beta. Geometry-first screening; no authentication."""
+"""ABI OOH LDA Quick Check v6 beta. Geometry-first screening; no authentication."""
 import io
 import math
 import re
@@ -158,7 +158,8 @@ def screen(df, lat_col, lon_col, id_col, feet):
     if len(records) > 3000: raise ValueError("Beta limit: 3,000 placements per screening run.")
     if records[id_col].isna().any(): raise ValueError("Placement IDs cannot be blank.")
     records["Placement ID"] = records[id_col].astype(str)
-    # Beta limitation: a single local UTM zone; restrict area to prevent misleading distances.
+    # Use a local UTM projection for distances. For unusually wide/multi-zone inventories,
+    # require separate regional runs to avoid distorted measurements.
     center_lat = float(records["Latitude"].median()); center_lon = float(records["Longitude"].median())
     zone = max(1, min(60, int((center_lon + 180) // 6) + 1))
     epsg = (32600 if center_lat >= 0 else 32700) + zone
@@ -167,13 +168,44 @@ def screen(df, lat_col, lon_col, id_col, feet):
     xy = [transform(forward, Point(lon, lat)) for lat, lon in zip(records["Latitude"], records["Longitude"])]
     minx = min(p.x for p in xy); maxx = max(p.x for p in xy)
     miny = min(p.y for p in xy); maxy = max(p.y for p in xy)
-    if max(maxx-minx, maxy-miny) > 18000:
-        raise ValueError("This beta supports placements within an approximately 18 km square. Split large markets into smaller batches. No results generated.")
-    margin = feet * 0.3048 + 50 * 0.3048 + 200
-    llbounds = transform(reverse, Polygon([(minx-margin,miny-margin),(maxx+margin,miny-margin),(maxx+margin,maxy+margin),(minx-margin,maxy+margin)])).bounds
-    bbox = (llbounds[1],llbounds[0],llbounds[3],llbounds[2])
-    elements = fetch_osm(tuple(round(x, 7) for x in bbox))
-    if not elements: raise ValueError("OSM returned zero facilities. Refusing to classify placements as green.")
+    if max(maxx-minx, maxy-miny) > 250000:
+        raise ValueError("Inventory spans over 250 km. Separate geographically distant markets so the local distance projection remains appropriate.")
+    # Tile occupied placement locations rather than the entire bounding rectangle.
+    # Each OSM request includes a safety halo, so a facility immediately outside
+    # the tile cannot silently disappear at a tile boundary.
+    TILE_METERS = 6500
+    margin = feet * 0.3048 + 50 * 0.3048 + 350
+    tile_points = {}
+    for idx, pt in enumerate(xy):
+        cell = (math.floor(pt.x / TILE_METERS), math.floor(pt.y / TILE_METERS))
+        tile_points.setdefault(cell, []).append(idx)
+    if len(tile_points) > 160:
+        raise ValueError(f"This inventory requires {len(tile_points)} geographic tiles; the beta safety cap is 160. Separate distant regions into runs.")
+    all_elements = {}
+    failures = []
+    progress = st.progress(0, text=f"Retrieving mapped facilities: 0/{len(tile_points)} tiles")
+    for count, (cell, indices) in enumerate(sorted(tile_points.items()), 1):
+        # A tighter occupied-point bbox reduces OSM query size while retaining halo.
+        xs = [xy[i].x for i in indices]; ys = [xy[i].y for i in indices]
+        area = Polygon([(min(xs)-margin,min(ys)-margin), (max(xs)+margin,min(ys)-margin),
+                        (max(xs)+margin,max(ys)+margin), (min(xs)-margin,max(ys)+margin)])
+        west,south,east,north = transform(reverse,area).bounds
+        bbox = tuple(round(v,7) for v in (south,west,north,east))
+        try:
+            batch = fetch_osm(bbox)
+            for element in batch:
+                key = (element.get("type"), element.get("id"))
+                if key[0] and key[1] is not None:
+                    all_elements[key] = element
+        except Exception as exc:
+            failures.append(f"Tile {cell}: {exc}")
+        progress.progress(count/len(tile_points),text=f"Retrieving mapped facilities: {count}/{len(tile_points)} tiles")
+    progress.empty()
+    if failures:
+        raise RuntimeError(f"OSM retrieval failed in {len(failures)} of {len(tile_points)} tiles. No results generated, to avoid false green classifications. " + " | ".join(failures[:3]))
+    elements = list(all_elements.values())
+    if not elements:
+        raise ValueError("OSM returned zero facilities across all tiles. Refusing to classify placements as green.")
     facilities = []
     seen = set()
     for e in elements:
@@ -256,7 +288,7 @@ with st.expander("1 · Upload sanitized placement inventory", expanded=True):
             lon_col=c2.selectbox("Longitude column",cols,index=cols.index(lon_guess) if lon_guess in cols else min(1,len(cols)-1))
             id_col=c3.selectbox("Placement ID column",cols,index=cols.index(id_guess) if id_guess in cols else 0)
             feet=st.selectbox("Screening buffer",[500,250],index=0,format_func=lambda x:f"{x} feet + 50-foot review band")
-            st.caption(f"{len(data):,} rows loaded. Beta uses one screening distance per batch; split mixed-exception markets into separate uploads.")
+            st.caption(f"{len(data):,} rows loaded. Geographic requests are automatically tiled. Beta uses one screening distance per run; split mixed-exception markets into separate uploads.")
             if st.button("Run geographic screening",type="primary"):
                 st.session_state.pop("screened",None)
                 with st.spinner("Retrieving public OSM facilities and screening coordinates…"):
