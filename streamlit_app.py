@@ -1,4 +1,4 @@
-"""ABI OOH LDA Quick Check beta. Public OSM screening, no authentication yet."""
+"""ABI OOH LDA Quick Check v5 beta. Geometry-first screening; no authentication."""
 import io
 import math
 import re
@@ -6,12 +6,16 @@ import zipfile
 from datetime import datetime, timezone
 
 import pandas as pd
-import pydeck as pdk
+import folium
+from folium import plugins
+from streamlit_folium import st_folium
+from branca.element import MacroElement
+from jinja2 import Template
 import requests
 import streamlit as st
 from pyproj import CRS, Transformer
-from shapely.geometry import Point, Polygon
-from shapely.ops import transform
+from shapely.geometry import Point, Polygon, shape, mapping, MultiPolygon, LineString
+from shapely.ops import transform, unary_union
 
 st.set_page_config(page_title="ABI OOH · LDA Quick Check", page_icon="📍", layout="wide")
 st.markdown("""<style>.block-container{padding-top:1.7rem;max-width:1500px}h1{letter-spacing:-.035em}div[data-testid="stMetric"]{background:#152334;padding:14px;border-radius:12px}</style>""", unsafe_allow_html=True)
@@ -39,20 +43,79 @@ def classify(tags):
 
 
 def osm_geometry(e):
-    if e.get("type") == "node": return Point(float(e["lon"]), float(e["lat"]))
+    """Use mapped footprints; retain incomplete ways as point-only *uncertain* sources.
+
+    Overpass `out geom` relations may include member geometries rather than top-level
+    coordinates. We conservatively union closed outer rings; holes are not legal-grade.
+    """
+    if e.get("type") == "node":
+        return Point(float(e["lon"]), float(e["lat"])), "point"
+    rings = []
     points = [(p["lon"], p["lat"]) for p in e.get("geometry", []) if "lon" in p and "lat" in p]
     if len(points) >= 4 and points[0] == points[-1]:
-        poly = Polygon(points)
-        if not poly.is_valid: poly = poly.buffer(0)
-        if not poly.is_empty: return poly
-    # Incomplete ways/relations are excluded rather than incorrectly considered precise footprints.
-    return None
+        rings.append(points)
+    if e.get("type") == "relation":
+        for member in e.get("members", []):
+            if member.get("role") not in ("outer", ""):
+                continue
+            pts = [(p["lon"], p["lat"]) for p in member.get("geometry", []) if "lon" in p and "lat" in p]
+            if len(pts) >= 4 and pts[0] == pts[-1]:
+                rings.append(pts)
+    polys=[]
+    for ring in rings:
+        poly=Polygon(ring)
+        if not poly.is_valid: poly=poly.buffer(0)
+        if not poly.is_empty and poly.area>0: polys.append(poly)
+    if polys:
+        geom=unary_union(polys)
+        return geom, "footprint"
+    # An incomplete way or relation is NOT a reliable footprint.
+    center=e.get("center") or {}
+    if "lat" in center and "lon" in center:
+        return Point(float(center["lon"]),float(center["lat"])), "incomplete"
+    if points:
+        return Point(float(points[0][0]),float(points[0][1])), "incomplete"
+    return None, "missing"
+
+
+class LiveRuler(MacroElement):
+    """Two-click Leaflet ruler with continuously updating feet on mouse movement."""
+    _template = Template("""
+    {% macro script(this, kwargs) %}
+    (function(){
+      var map={{this._parent.get_name()}};
+      var active=false, start=null, line=null, tip=null;
+      var ctl=L.control({position:'topleft'});
+      ctl.onAdd=function(){
+        var btn=L.DomUtil.create('button','leaflet-bar');
+        btn.type='button';btn.innerHTML='📏';btn.title='Ruler: click start, move, click finish; press Esc to cancel';
+        btn.style.cssText='background:#172b3c;color:white;border:1px solid #94a3b8;width:34px;height:34px;font-size:19px;cursor:pointer';
+        L.DomEvent.disableClickPropagation(btn);
+        L.DomEvent.on(btn,'click',function(){active=!active;start=null;if(line){map.removeLayer(line);line=null;}if(tip){map.removeLayer(tip);tip=null;}btn.style.background=active?'#0e7490':'#172b3c';});
+        return btn;
+      };ctl.addTo(map);
+      map.on('click',function(e){
+        if(!active)return;
+        if(!start){start=e.latlng;line=L.polyline([start,start],{color:'#38bdf8',weight:3,dashArray:'7 5'}).addTo(map);}
+        else {line.setLatLngs([start,e.latlng]);active=false;start=null;}
+      });
+      map.on('mousemove',function(e){
+        if(!active||!start)return;
+        var ft=start.distanceTo(e.latlng)*3.280839895;
+        line.setLatLngs([start,e.latlng]);
+        if(tip)map.removeLayer(tip);
+        tip=L.tooltip({permanent:true,direction:'top',className:'distance-tip'}).setLatLng(e.latlng).setContent(ft.toLocaleString(undefined,{maximumFractionDigits:1})+' ft').addTo(map);
+      });
+      map.on('keydown',function(e){if(e.originalEvent&&e.originalEvent.key==='Escape'){active=false;start=null;if(line)map.removeLayer(line);if(tip)map.removeLayer(tip);}});
+    })();
+    {% endmacro %}
+    """)
 
 
 def overpass_query(bbox):
     s, w, n, e = bbox
     selector = "".join(f'nwr["{k}"="{v}"]({s:.6f},{w:.6f},{n:.6f},{e:.6f});' for k, vals in CATEGORIES.items() for v in vals)
-    return "[out:json][timeout:150];(" + selector + ");out geom;"
+    return "[out:json][timeout:150];(" + selector + ");out center geom;"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -80,7 +143,12 @@ def identify_column(cols, names):
 
 
 def screen(df, lat_col, lon_col, id_col, feet):
-    records = df.copy().reset_index(drop=True)
+    # Explicitly prevent common financial columns from being retained or exported.
+    prohibited = re.compile(r"(^|[^a-z])(rate|cpm|cost|budget|discount|net price|gross price|spend|investment)([^a-z]|$)",re.I)
+    records = df.drop(columns=[c for c in df.columns if prohibited.search(str(c))]).copy().reset_index(drop=True)
+    for required in (lat_col,lon_col,id_col):
+        if required not in records.columns:
+            raise ValueError(f"Required column {required!r} was classified as financial. Rename the location column and retry.")
     records["Latitude"] = pd.to_numeric(records[lat_col], errors="coerce")
     records["Longitude"] = pd.to_numeric(records[lon_col], errors="coerce")
     valid = records["Latitude"].between(-90, 90) & records["Longitude"].between(-180, 180)
@@ -114,15 +182,22 @@ def screen(df, lat_col, lon_col, id_col, feet):
         seen.add(key)
         cat = classify(e.get("tags", {}))
         if not cat: continue
-        g = osm_geometry(e)
+        g, quality = osm_geometry(e)
         if g is None: continue
         gm = transform(forward, g)
         if gm.is_empty: continue
         pt = g.representative_point()
         facilities.append({"key": f"{key[0]}/{key[1]}", "name": e.get("tags", {}).get("name", "Unnamed OSM facility"), "category": cat,
-                           "geometry": gm, "lat": pt.y, "lon": pt.x})
+                           "geometry": gm, "geometry_quality": quality, "lat": pt.y, "lon": pt.x})
     if not facilities: raise ValueError("No usable facility geometries returned. Refusing to classify placements as green.")
+    # Coverage uncertainty: point/incomplete geometries are never treated as
+    # authoritative red polygons. They can only trigger additional review.
     rows=[]; matched={}
+    match_geometry={}
+    for f in facilities:
+        if f["geometry_quality"] == "footprint":
+            match_geometry[f["key"]] = f["geometry"]
+
     for i, point in enumerate(xy):
         nearby=[]
         for f in facilities:
@@ -130,9 +205,9 @@ def screen(df, lat_col, lon_col, id_col, feet):
             if distance <= feet + 50:
                 nearby.append((distance, f))
         nearby.sort(key=lambda x:x[0])
-        red = [(d,f) for d,f in nearby if d <= feet and f["category"] != "University approval"]
-        uni = [(d,f) for d,f in nearby if d <= feet and f["category"] == "University approval"]
-        band = [(d,f) for d,f in nearby if feet < d <= feet+50]
+        red = [(d,f) for d,f in nearby if d <= feet and f["category"] != "University approval" and f["geometry_quality"] == "footprint"]
+        uni = [(d,f) for d,f in nearby if d <= feet and f["category"] == "University approval" and f["geometry_quality"] == "footprint"]
+        band = [(d,f) for d,f in nearby if feet < d <= feet+50 or (d <= feet and f["geometry_quality"] != "footprint")]
         if red: status="Potential conflict"; relevant=red
         elif uni: status="University approval"; relevant=uni
         elif band: status="Needs more screening"; relevant=band
@@ -142,9 +217,10 @@ def screen(df, lat_col, lon_col, id_col, feet):
                      "Facility Category":closest[1]["category"] if closest else "",
                      "Distance to Facility (ft)":round(closest[0],1) if closest else None,
                      "Matched OSM ID":closest[1]["key"] if closest else "",
+                     "Source Geometry":closest[1]["geometry_quality"] if closest else "",
                      "Recommendation":"Pending", "Reviewer Notes":""})
         for distance, f in relevant:
-            matched.setdefault(f["key"], {"Facility Name":f["name"], "Facility Category":f["category"], "OSM ID":f["key"],
+            matched.setdefault(f["key"], {"Facility Name":f["name"], "Facility Category":f["category"], "OSM ID":f["key"], "Geometry Quality":f["geometry_quality"],
                                          "Latitude":f["lat"], "Longitude":f["lon"], "Affected Placement IDs":set()})
             matched[f["key"]]["Affected Placement IDs"].add(records.loc[i,"Placement ID"])
     output = pd.concat([records, pd.DataFrame(rows)],axis=1)
@@ -152,15 +228,15 @@ def screen(df, lat_col, lon_col, id_col, feet):
     for f in matched.values():
         f["Affected Placement IDs"]="; ".join(sorted(f["Affected Placement IDs"]))
         facility_rows.append(f)
-    return output, pd.DataFrame(facility_rows, columns=["Facility Name","Facility Category","OSM ID","Latitude","Longitude","Affected Placement IDs"]), len(facilities)
+    return output, pd.DataFrame(facility_rows, columns=["Facility Name","Facility Category","OSM ID","Geometry Quality","Latitude","Longitude","Affected Placement IDs"]), len(facilities), facilities, epsg
 
 
 def csv_bytes(df): return df.to_csv(index=False).encode("utf-8-sig")
 
-st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v4")
+st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v5")
 st.title("Quick Check · Campaign Screening")
-st.write("Screen sanitized placement coordinates, investigate mapped facilities, and prepare a Google My Maps recommendation export.")
-st.warning("**Beta / preliminary only.** OSM is incomplete; green means no intersection with the retrieved mapped facilities, **not legal clearance**. University approval and the 50-foot review band are separate review categories. No authentication: use synthetic or explicitly approved data only.")
+st.write("Screen sanitized placement coordinates, investigate mapped building-footprint buffers, measure distances, and prepare a Google My Maps recommendation export.")
+st.warning("**Beta / preliminary only.** OSM is incomplete, and some facilities are only mapped as points or may be missing entirely; green means no intersection with the retrieved mapped facilities, **not legal clearance**. University approval and the 50-foot review band are separate review categories. No authentication: use synthetic or explicitly approved data only.")
 
 with st.expander("1 · Upload sanitized placement inventory", expanded=True):
     uploaded = st.file_uploader("CSV or Excel (no rates, budgets, client financial information)", type=["csv","xlsx"])
@@ -184,11 +260,13 @@ with st.expander("1 · Upload sanitized placement inventory", expanded=True):
             if st.button("Run geographic screening",type="primary"):
                 st.session_state.pop("screened",None)
                 with st.spinner("Retrieving public OSM facilities and screening coordinates…"):
-                    result, facilities, n = screen(data,lat_col,lon_col,id_col,feet)
+                    result, facilities, n, all_geometries, epsg = screen(data,lat_col,lon_col,id_col,feet)
                 st.session_state["screened"] = result
                 st.session_state["facilities"] = facilities
                 st.session_state["source_count"] = n
                 st.session_state["buffer"] = feet
+                st.session_state["geometries"] = all_geometries
+                st.session_state["epsg"] = epsg
         except Exception as exc:
             st.error(f"{type(exc).__name__}: {exc}")
 
@@ -208,17 +286,67 @@ st.caption(f"{st.session_state['source_count']:,} mapped OSM source geometries a
 status_options=list(STATUS_COLORS)
 selected_status=st.multiselect("Show screening statuses",status_options,default=status_options)
 filtered=result[result["Screening Status"].isin(selected_status)].copy()
-view=filtered[["Placement ID","Latitude","Longitude","Screening Status","Matched Facility","Facility Category","Distance to Facility (ft)","Recommendation","Reviewer Notes"]].copy()
-if not view.empty:
-    view["color"]=view["Screening Status"].map(STATUS_COLORS)
-    view["tooltip"] = view["Placement ID"].astype(str)+" · "+view["Screening Status"]+" · "+view["Matched Facility"].fillna("")
-    layers=[pdk.Layer("ScatterplotLayer",view,get_position="[Longitude, Latitude]",get_fill_color="color",get_radius=40,radius_min_pixels=5,radius_max_pixels=13,pickable=True)]
-    if not facilities.empty:
-        facilities_map=facilities.copy();facilities_map["color"]=[[25,25,25,230]]*len(facilities_map)
-        layers.append(pdk.Layer("ScatterplotLayer",facilities_map,get_position="[Longitude, Latitude]",get_fill_color="color",get_line_color="[240,240,240]",line_width_min_pixels=1,stroked=True,get_radius=28,radius_min_pixels=4,radius_max_pixels=9,pickable=True))
-    st.pydeck_chart(pdk.Deck(map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",initial_view_state=pdk.ViewState(latitude=float(view["Latitude"].median()),longitude=float(view["Longitude"].median()),zoom=12,pitch=0),layers=layers,tooltip={"html":"<b>{Placement ID}{Facility Name}</b><br/>{Screening Status}{Facility Category}<br/>{Matched Facility}","style":{"backgroundColor":"#182434","color":"white"}}),height=510)
+st.subheader("3 · Interactive footprint map")
+mc1,mc2,mc3,mc4=st.columns(4)
+show_red=mc1.checkbox("Red restricted buffers",True)
+show_yellow=mc2.checkbox("University buffers",True)
+show_sources=mc3.checkbox("Matched facility pins",True)
+show_review=mc4.checkbox("50-foot review band",False)
+st.caption("📏 Ruler: click the toolbar ruler, click a start point, move for live feet, click again to finish. Map buffers extend from mapped facility footprints, not address centers.")
+if not filtered.empty:
+    center=[float(filtered["Latitude"].median()),float(filtered["Longitude"].median())]
+    m=folium.Map(location=center,zoom_start=13,tiles="CartoDB dark_matter",control_scale=True,prefer_canvas=True)
+    m.add_child(LiveRuler())
+    clusters={}
+    for status,color in [("Potential conflict","#eb4753"),("Needs more screening","#f5be38"),("University approval","#f5be38"),("No mapped hit","#3dc08f")]:
+        grp=folium.FeatureGroup(name=status,show=True)
+        for _,r in filtered[filtered["Screening Status"]==status].iterrows():
+            desc=(f"<b>{str(r['Placement ID'])}</b><br>{status}<br>Facility: {str(r['Matched Facility'])}"
+                  f"<br>Distance: {r['Distance to Facility (ft)']} ft<br>OSM: {r['Matched OSM ID']}")
+            folium.CircleMarker([r["Latitude"],r["Longitude"]],radius=6,color="white",weight=1,fill=True,fill_color=color,fill_opacity=.95,tooltip=str(r["Placement ID"]),popup=folium.Popup(desc,max_width=350)).add_to(grp)
+        grp.add_to(m)
+    # Only draw buffers around relevant sources near the displayed placements.
+    # Use projected footprint geometries (meters), not point circles.
+    projected_to_ll=Transformer.from_crs(f"EPSG:{st.session_state['epsg']}","EPSG:4326",always_xy=True).transform
+    pts=[Point(float(r["Longitude"]),float(r["Latitude"])) for _,r in filtered.iterrows()]
+    ll_to_projected=Transformer.from_crs("EPSG:4326",f"EPSG:{st.session_state['epsg']}",always_xy=True).transform
+    active_pts=[transform(ll_to_projected,pt) for pt in pts]
+    search_area=unary_union(active_pts).buffer((st.session_state['buffer']+150)*.3048)
+    red_layer=folium.FeatureGroup(name="Restricted footprint buffers",show=show_red)
+    yellow_layer=folium.FeatureGroup(name="University footprint buffers",show=show_yellow)
+    band_layer=folium.FeatureGroup(name="50-foot review bands",show=show_review)
+    displayed=0
+    for f in st.session_state["geometries"]:
+        if f["geometry_quality"] != "footprint": continue
+        geom=f["geometry"]
+        if not geom.intersects(search_area): continue
+        if displayed>=450:
+            st.warning("Map polygon preview capped at 450 nearby facilities for performance. Screening still considered all retrieved facilities.")
+            break
+        displayed+=1
+        buffered=geom.buffer(st.session_state['buffer']*.3048, resolution=8)
+        is_uni=f["category"]=="University approval"
+        target=yellow_layer if is_uni else red_layer
+        color="#f5be38" if is_uni else "#eb4753"
+        # Simplification affects map display ONLY, not screening geometry.
+        visual=transform(projected_to_ll,buffered.simplify(1.5,preserve_topology=True))
+        folium.GeoJson(mapping(visual),style_function=lambda feature,c=color:{"color":c,"weight":1.6,"fillColor":c,"fillOpacity":.13},tooltip=f"{f['name']} · {f['category']} · {f['key']} · footprint buffer").add_to(target)
+        if show_review:
+            outer=geom.buffer((st.session_state['buffer']+50)*.3048,resolution=8)
+            ring=outer.difference(buffered)
+            folium.GeoJson(mapping(transform(projected_to_ll,ring.simplify(1.5,preserve_topology=True))),style_function=lambda feature:{"color":"#f5be38","weight":.7,"fillColor":"#f5be38","fillOpacity":.08}).add_to(band_layer)
+    red_layer.add_to(m);yellow_layer.add_to(m);band_layer.add_to(m)
+    if show_sources and not facilities.empty:
+        source_layer=folium.FeatureGroup(name="Matched OSM facility pins",show=True)
+        for _,f in facilities.iterrows():
+            folium.CircleMarker([f["Latitude"],f["Longitude"]],radius=4,color="#f1f5f9",weight=1,fill=True,fill_color="#151515",fill_opacity=1,
+                popup=f"{f['Facility Name']} · {f['Facility Category']} · {f['OSM ID']} · {f['Geometry Quality']}").add_to(source_layer)
+        source_layer.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    st_folium(m,height=565,width=None,returned_objects=[],key="map_v5")
+    st.caption(f"Displayed {displayed} nearby mapped footprint buffers. Incomplete geometries and point-only OSM sources are not drawn as authoritative footprint polygons. Screening uses unsimplified geometries.")
 else:st.info("No placements match these filters.")
-st.caption("Colored dots = placements; black dots = matched OSM facilities. Facility dots are representative points, not legal boundary markers.")
+st.caption("Green = no detected intersection with retrieved OSM sources, NOT clearance. The map is a visual investigation aid; verify OSM footprint completeness and applicable legal rules.")
 st.write("**Edit recommendations below.** Changes persist during this browser session and drive the client export.")
 edit_cols=["Placement ID","Screening Status","Matched Facility","Distance to Facility (ft)","Recommendation","Reviewer Notes"]
 edited=st.data_editor(result[edit_cols],hide_index=True,use_container_width=True,num_rows="fixed",
@@ -229,7 +357,7 @@ result["Reviewer Notes"]=edited["Reviewer Notes"].values
 st.session_state["screened"]=result
 
 st.divider()
-st.subheader("3 · Export for Google My Maps")
+st.subheader("4 · Export for Google My Maps")
 recommended=result[result["Recommendation"]=="Recommend"].copy()
 st.write(f"**{len(recommended)} placements marked Recommend**. Only those placements go into the client-facing recommendation CSV.")
 export_cols=["Placement ID","Latitude","Longitude","Screening Status","Recommendation","Reviewer Notes","Matched Facility","Facility Category","Distance to Facility (ft)"]
