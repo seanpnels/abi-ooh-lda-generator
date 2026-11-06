@@ -1,10 +1,11 @@
-"""ABI OOH LDA Quick Check v8 beta. Concurrent, cancellable nationwide screening."""
+"""ABI OOH LDA Quick Check v9 beta. Concurrent, cancellable nationwide screening."""
 import io
 import math
 import re
 import zipfile
 import threading
 import time
+import random
 import uuid
 from collections import OrderedDict
 from urllib.parse import quote
@@ -146,43 +147,124 @@ def run_job(job, df, lat_col, lon_col, id_col, feet):
 
 
 
+# Bounded waits prevent public Overpass or Streamlit Cloud from hanging forever.
+# These are client-side limits, not a way to override server-side limits.
+OVERPASS_QUERY_TIMEOUT = 240  # seconds requested of the Overpass interpreter
+OVERPASS_READ_TIMEOUT = 270   # seconds allowed to read a server response
+OVERPASS_CONNECT_TIMEOUT = 15
+OVERPASS_RETRY_ROUNDS = 2
+OVERPASS_SPLIT_DEPTH = 2
+
+
 def overpass_query(bbox):
     s, w, n, e = bbox
     selector = "".join(f'nwr["{k}"="{v}"]({s:.6f},{w:.6f},{n:.6f},{e:.6f});' for k, vals in CATEGORIES.items() for v in vals)
-    return "[out:json][timeout:150];(" + selector + ");out center geom;"
+    return f"[out:json][timeout:{OVERPASS_QUERY_TIMEOUT}];(" + selector + ");out center geom;"
 
 
-def fetch_osm(bbox, job=None):
-    """Thread-safe shared TTL cache of public OSM tile results, not campaign inputs."""
-    check_cancel(job)
-    key = tuple(bbox)
-    now = time.monotonic()
+def _cached_osm(bbox):
+    key = tuple(round(float(v), 7) for v in bbox)
     with _OSM_CACHE["lock"]:
         entry = _OSM_CACHE["data"].get(key)
-        if entry is not None and now - entry[0] < _OSM_CACHE_TTL:
+        if entry and time.monotonic() - entry[0] < _OSM_CACHE_TTL:
             _OSM_CACHE["data"].move_to_end(key)
             return entry[1]
         _OSM_CACHE["data"].pop(key, None)
-    errors = []
-    for endpoint in OSM_ENDPOINTS:
+    return None
+
+
+def _store_osm(bbox, elements):
+    key = tuple(round(float(v), 7) for v in bbox)
+    with _OSM_CACHE["lock"]:
+        _OSM_CACHE["data"][key] = (time.monotonic(), elements)
+        _OSM_CACHE["data"].move_to_end(key)
+        while len(_OSM_CACHE["data"]) > _OSM_CACHE_MAX:
+            _OSM_CACHE["data"].popitem(last=False)
+
+
+def _wait_with_cancel(seconds, job):
+    # Backoff is interruptible so Abort does not wait for the entire delay.
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
         check_cancel(job)
-        try:
-            response = requests.post(endpoint, data={"data": overpass_query(bbox)}, timeout=(12, 75),
-                                     headers={"User-Agent": "ABI-OOH-QuickCheck-beta/0.8"})
-            response.raise_for_status()
-            result = response.json()
-            if "elements" not in result:
-                raise ValueError("No elements key returned")
+        time.sleep(min(.3, max(0, until - time.monotonic())))
+
+
+def _fetch_direct(bbox, job=None):
+    """Attempt a whole bounding box; cache only validated complete responses."""
+    check_cancel(job)
+    cached = _cached_osm(bbox)
+    if cached is not None:
+        return cached
+    errors = []
+    for attempt in range(OVERPASS_RETRY_ROUNDS):
+        for endpoint in OSM_ENDPOINTS:
             check_cancel(job)
-            with _OSM_CACHE["lock"]:
-                _OSM_CACHE["data"][key] = (time.monotonic(), result["elements"])
-                _OSM_CACHE["data"].move_to_end(key)
-                while len(_OSM_CACHE["data"]) > _OSM_CACHE_MAX:
-                    _OSM_CACHE["data"].popitem(last=False)
-            return result["elements"]
-        except Exception as exc:
-            errors.append(f"{endpoint}: {type(exc).__name__}: {exc}")
-    raise RuntimeError("OSM retrieval failed; no screening results were produced. " + " | ".join(errors))
+            try:
+                response = requests.post(
+                    endpoint, data={"data": overpass_query(bbox)},
+                    timeout=(OVERPASS_CONNECT_TIMEOUT, OVERPASS_READ_TIMEOUT),
+                    headers={"User-Agent": "ABI-OOH-QuickCheck-beta/0.9"})
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("elements"), list):
+                    raise ValueError("Overpass response lacked a valid elements array")
+                check_cancel(job)
+                _store_osm(bbox, payload["elements"])
+                return payload["elements"]
+            except ScreeningCancelled:
+                raise
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"{endpoint.rsplit('/', 2)[0]}: {type(exc).__name__}: {str(exc)[:160]}")
+        if attempt + 1 < OVERPASS_RETRY_ROUNDS:
+            _wait_with_cancel(min(12, 3 * (2 ** attempt)), job)
+    raise RuntimeError("; ".join(errors[-4:]))
+
+
+def _split_bbox(bbox):
+    """Four overlapping rectangles covering the entire original search bbox."""
+    south, west, north, east = bbox
+    midlat = (south + north) / 2
+    midlon = (west + east) / 2
+    # Tiny overlap avoids gaps from coordinate rounding at subdivision edges.
+    overlap = 0.00002
+    return [
+        (south, west, min(north, midlat + overlap), min(east, midlon + overlap)),
+        (south, max(west, midlon - overlap), min(north, midlat + overlap), east),
+        (max(south, midlat - overlap), west, north, min(east, midlon + overlap)),
+        (max(south, midlat - overlap), max(west, midlon - overlap), north, east),
+    ]
+
+
+def fetch_osm(bbox, job=None, depth=0):
+    """Retries public servers; subdivides failed boxes and caches each success.
+
+    If any child fails, the parent fails closed. Partial results are NEVER
+    returned to screening as though geographic coverage were complete.
+    """
+    check_cancel(job)
+    cached = _cached_osm(bbox)
+    if cached is not None:
+        return cached
+    try:
+        return _fetch_direct(bbox, job)
+    except RuntimeError as exc:
+        if depth >= OVERPASS_SPLIT_DEPTH:
+            raise RuntimeError(f"OSM retrieval still failed after splitting (depth {depth}): {exc}") from exc
+        if job is not None:
+            with job.lock:
+                job.message = f"OSM request slow; retrying smaller geographic sections (level {depth + 1}/{OVERPASS_SPLIT_DEPTH})"
+        combined = {}
+        for child in _split_bbox(bbox):
+            check_cancel(job)
+            for item in fetch_osm(child, job, depth + 1):
+                key = (item.get("type"), item.get("id"))
+                if key[0] is not None and key[1] is not None:
+                    combined[key] = item
+        # Only mark the parent as successful after ALL four children succeed.
+        elements = list(combined.values())
+        _store_osm(bbox, elements)
+        return elements
 
 
 def identify_column(cols, names):
@@ -405,9 +487,10 @@ def excel_bytes(df):
     return buf.getvalue()
 
 
-st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v8 · CONCURRENT QUICK CHECK")
+st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v9 · CONCURRENT QUICK CHECK")
 st.title("Quick Check · Campaign Screening")
 st.write("Screen sanitized placement coordinates, investigate mapped building-footprint buffers, measure distances, and prepare a Google My Maps recommendation export.")
+st.caption("v9 retrieval: extended bounded waits, retry/backoff, automatic 4-way subdivision on failed requests, and shared cache of successful OSM sections. A failed section still prevents a completed screening result.")
 st.warning("**Beta / preliminary only.** OSM is incomplete, and some facilities are only mapped as points or may be missing entirely; green means no intersection with the retrieved mapped facilities, **not legal clearance**. University approval and the 50-foot review band are separate review categories. No authentication: use synthetic or explicitly approved data only.")
 
 with st.expander("1 · Upload sanitized placement inventory", expanded=True):
