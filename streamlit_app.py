@@ -1,16 +1,21 @@
-"""ABI OOH LDA Quick Check v7 beta. Nationwide regional screening; no authentication."""
+"""ABI OOH LDA Quick Check v8 beta. Concurrent, cancellable nationwide screening."""
 import io
 import math
 import re
 import zipfile
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from urllib.parse import quote
 from datetime import datetime, timezone
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
 
 import pandas as pd
 import folium
 from folium import plugins
 from streamlit_folium import st_folium
-from branca.element import MacroElement
-from jinja2 import Template
 import requests
 import streamlit as st
 from pyproj import CRS, Transformer
@@ -78,38 +83,67 @@ def osm_geometry(e):
     return None, "missing"
 
 
-class LiveRuler(MacroElement):
-    """Two-click Leaflet ruler with continuously updating feet on mouse movement."""
-    _template = Template("""
-    {% macro script(this, kwargs) %}
-    (function(){
-      var map={{this._parent.get_name()}};
-      var active=false, start=null, line=null, tip=null;
-      var ctl=L.control({position:'topleft'});
-      ctl.onAdd=function(){
-        var btn=L.DomUtil.create('button','leaflet-bar');
-        btn.type='button';btn.innerHTML='📏';btn.title='Ruler: click start, move, click finish; press Esc to cancel';
-        btn.style.cssText='background:#172b3c;color:white;border:1px solid #94a3b8;width:34px;height:34px;font-size:19px;cursor:pointer';
-        L.DomEvent.disableClickPropagation(btn);
-        L.DomEvent.on(btn,'click',function(){active=!active;start=null;if(line){map.removeLayer(line);line=null;}if(tip){map.removeLayer(tip);tip=null;}btn.style.background=active?'#0e7490':'#172b3c';});
-        return btn;
-      };ctl.addTo(map);
-      map.on('click',function(e){
-        if(!active)return;
-        if(!start){start=e.latlng;line=L.polyline([start,start],{color:'#38bdf8',weight:3,dashArray:'7 5'}).addTo(map);}
-        else {line.setLatLngs([start,e.latlng]);active=false;start=null;}
-      });
-      map.on('mousemove',function(e){
-        if(!active||!start)return;
-        var ft=start.distanceTo(e.latlng)*3.280839895;
-        line.setLatLngs([start,e.latlng]);
-        if(tip)map.removeLayer(tip);
-        tip=L.tooltip({permanent:true,direction:'top',className:'distance-tip'}).setLatLng(e.latlng).setContent(ft.toLocaleString(undefined,{maximumFractionDigits:1})+' ft').addTo(map);
-      });
-      map.on('keydown',function(e){if(e.originalEvent&&e.originalEvent.key==='Escape'){active=false;start=null;if(line)map.removeLayer(line);if(tip)map.removeLayer(tip);}});
-    })();
-    {% endmacro %}
-    """)
+class ScreeningCancelled(Exception):
+    pass
+
+
+class ScreeningJob:
+    """One job per browser session; independent workers, no shared campaign data."""
+    def __init__(self):
+        self.id = str(uuid.uuid4())
+        self.cancel = threading.Event()
+        self.lock = threading.RLock()
+        self.status = "running"
+        self.progress = 0.0
+        self.message = "Preparing geographic screening…"
+        self.result = None
+        self.error = None
+
+    def update(self, fraction, message):
+        with self.lock:
+            self.progress = min(1.0, max(0.0, float(fraction)))
+            self.message = message
+
+    def snapshot(self):
+        with self.lock:
+            return self.status, self.progress, self.message, self.result, self.error
+
+
+def check_cancel(job):
+    if job is not None and job.cancel.is_set():
+        raise ScreeningCancelled("Screening cancelled by user")
+
+
+@st.cache_resource(show_spinner=False)
+def osm_cache():
+    # Shared only for public OSM responses; no inventory or recommendations cached.
+    return {"data": OrderedDict(), "lock": threading.RLock()}
+
+
+_OSM_CACHE = osm_cache()
+_OSM_CACHE_TTL = 6 * 3600
+_OSM_CACHE_MAX = 600
+
+
+def run_job(job, df, lat_col, lon_col, id_col, feet):
+    try:
+        values = screen(df, lat_col, lon_col, id_col, feet, job=job)
+        check_cancel(job)
+        with job.lock:
+            job.result = values
+            job.progress = 1.0
+            job.message = "Screening complete"
+            job.status = "complete"
+    except ScreeningCancelled:
+        with job.lock:
+            job.status = "cancelled"
+            job.message = "Cancelled. No partial screening results were published."
+    except Exception as exc:
+        with job.lock:
+            job.status = "failed"
+            job.error = f"{type(exc).__name__}: {exc}"
+            job.message = "Screening failed; no partial results published"
+
 
 
 def overpass_query(bbox):
@@ -118,16 +152,33 @@ def overpass_query(bbox):
     return "[out:json][timeout:150];(" + selector + ");out center geom;"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_osm(bbox):
+def fetch_osm(bbox, job=None):
+    """Thread-safe shared TTL cache of public OSM tile results, not campaign inputs."""
+    check_cancel(job)
+    key = tuple(bbox)
+    now = time.monotonic()
+    with _OSM_CACHE["lock"]:
+        entry = _OSM_CACHE["data"].get(key)
+        if entry is not None and now - entry[0] < _OSM_CACHE_TTL:
+            _OSM_CACHE["data"].move_to_end(key)
+            return entry[1]
+        _OSM_CACHE["data"].pop(key, None)
     errors = []
     for endpoint in OSM_ENDPOINTS:
+        check_cancel(job)
         try:
-            response = requests.post(endpoint, data={"data": overpass_query(bbox)}, timeout=190,
-                                     headers={"User-Agent": "ABI-OOH-QuickCheck-beta/0.1"})
+            response = requests.post(endpoint, data={"data": overpass_query(bbox)}, timeout=(12, 75),
+                                     headers={"User-Agent": "ABI-OOH-QuickCheck-beta/0.8"})
             response.raise_for_status()
             result = response.json()
-            if "elements" not in result: raise ValueError("No elements key returned")
+            if "elements" not in result:
+                raise ValueError("No elements key returned")
+            check_cancel(job)
+            with _OSM_CACHE["lock"]:
+                _OSM_CACHE["data"][key] = (time.monotonic(), result["elements"])
+                _OSM_CACHE["data"].move_to_end(key)
+                while len(_OSM_CACHE["data"]) > _OSM_CACHE_MAX:
+                    _OSM_CACHE["data"].popitem(last=False)
             return result["elements"]
         except Exception as exc:
             errors.append(f"{endpoint}: {type(exc).__name__}: {exc}")
@@ -142,7 +193,7 @@ def identify_column(cols, names):
     return None
 
 
-def screen_region(df, lat_col, lon_col, id_col, feet):
+def screen_region(df, lat_col, lon_col, id_col, feet, job=None, region_number=1, region_total=1):
     # Explicitly prevent common financial columns from being retained or exported.
     prohibited = re.compile(r"(^|[^a-z])(rate|cpm|cost|budget|discount|net price|gross price|spend|investment)([^a-z]|$)",re.I)
     records = df.drop(columns=[c for c in df.columns if prohibited.search(str(c))]).copy().reset_index(drop=True)
@@ -181,7 +232,6 @@ def screen_region(df, lat_col, lon_col, id_col, feet):
         raise ValueError(f"Regional screening needs {len(tile_points)} OSM tiles, above the 160-tile regional safety limit. This region needs smaller automatic subregions.")
     all_elements = {}
     failures = []
-    progress = st.progress(0, text=f"Retrieving mapped facilities: 0/{len(tile_points)} tiles")
     for count, (cell, indices) in enumerate(sorted(tile_points.items()), 1):
         # A tighter occupied-point bbox reduces OSM query size while retaining halo.
         xs = [xy[i].x for i in indices]; ys = [xy[i].y for i in indices]
@@ -189,16 +239,20 @@ def screen_region(df, lat_col, lon_col, id_col, feet):
                         (max(xs)+margin,max(ys)+margin), (min(xs)-margin,max(ys)+margin)])
         west,south,east,north = transform(reverse,area).bounds
         bbox = tuple(round(v,7) for v in (south,west,north,east))
+        check_cancel(job)
+        if job is not None:
+            job.update(((region_number-1) + (count-1)/len(tile_points))/region_total, f"Region {region_number}/{region_total} · OSM tile {count}/{len(tile_points)}")
         try:
-            batch = fetch_osm(bbox)
+            batch = fetch_osm(bbox, job=job)
             for element in batch:
                 key = (element.get("type"), element.get("id"))
                 if key[0] and key[1] is not None:
                     all_elements[key] = element
         except Exception as exc:
             failures.append(f"Tile {cell}: {exc}")
-        progress.progress(count/len(tile_points),text=f"Retrieving mapped facilities: {count}/{len(tile_points)} tiles")
-    progress.empty()
+        check_cancel(job)
+        if job is not None:
+            job.update(((region_number-1) + count/len(tile_points))/region_total, f"Region {region_number}/{region_total} · OSM tile {count}/{len(tile_points)}")
     if failures:
         raise RuntimeError(f"OSM retrieval failed in {len(failures)} of {len(tile_points)} tiles. No results generated, to avoid false green classifications. " + " | ".join(failures[:3]))
     elements = list(all_elements.values())
@@ -229,6 +283,7 @@ def screen_region(df, lat_col, lon_col, id_col, feet):
             match_geometry[f["key"]] = f["geometry"]
 
     for i, point in enumerate(xy):
+        if i % 20 == 0: check_cancel(job)
         nearby=[]
         for f in facilities:
             distance = point.distance(f["geometry"]) / 0.3048
@@ -262,7 +317,7 @@ def screen_region(df, lat_col, lon_col, id_col, feet):
 
 
 
-def screen(df, lat_col, lon_col, id_col, feet):
+def screen(df, lat_col, lon_col, id_col, feet, job=None):
     """Screen nationwide inventories in independent local UTM regions.
 
     Every region gets its own projection and overlapping OSM requests; never
@@ -289,14 +344,16 @@ def screen(df, lat_col, lon_col, id_col, feet):
     outputs, facility_tables, source_geometries = [], [], []
     unique_sources = set()
     for k, (region, indices) in enumerate(sorted(groups.items()), 1):
-        st.caption(f"Screening geographic region {k}/{len(groups)} · {len(indices)} placements · UTM zone {region[1]}")
+        check_cancel(job)
+        if job is not None: job.update((k-1)/len(groups), f"Region {k}/{len(groups)} · {len(indices)} placements · UTM {region[1]}")
         subset = df.iloc[indices].copy()
         subset["__internal_row_index__"] = indices
-        output, facility_table, n, geometries, epsg = screen_region(subset, lat_col, lon_col, id_col, feet)
+        output, facility_table, n, geometries, epsg = screen_region(subset, lat_col, lon_col, id_col, feet, job=job, region_number=k, region_total=len(groups))
         outputs.append(output)
         facility_tables.append(facility_table)
         source_geometries.extend(geometries)
         unique_sources.update(f["key"] for f in geometries)
+    check_cancel(job)
     output = pd.concat(outputs, ignore_index=True).sort_values("__internal_row_index__").drop(columns=["__internal_row_index__"]).reset_index(drop=True)
     if facility_tables:
         facilities = pd.concat(facility_tables, ignore_index=True)
@@ -316,7 +373,39 @@ def screen(df, lat_col, lon_col, id_col, feet):
 
 def csv_bytes(df): return df.to_csv(index=False).encode("utf-8-sig")
 
-st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v7 · NATIONWIDE")
+
+def excel_bytes(df):
+    """Color entire rows by actual screening status; retain source columns."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Screening Results")
+        ws = writer.sheets["Screening Results"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        colors = {
+            "Potential conflict": "FCE4E6",
+            "Needs more screening": "FFF2CC",
+            "University approval": "FFF2CC",
+            "No mapped hit": "E2F0D9",
+            "Unable to verify": "E5E7EB",
+        }
+        headings = [cell.value for cell in ws[1]]
+        status_idx = headings.index("Screening Status") + 1
+        for cell in ws[1]:
+            cell.fill = PatternFill("solid", fgColor="17324A")
+            cell.font = Font(bold=True, color="FFFFFF")
+        for row in ws.iter_rows(min_row=2):
+            status = row[status_idx-1].value
+            fill = PatternFill("solid", fgColor=colors.get(status, "FFFFFF"))
+            for cell in row:
+                cell.fill = fill
+                cell.font = Font(color="202833")
+        for j, header in enumerate(headings, 1):
+            ws.column_dimensions[get_column_letter(j)].width = min(45, max(13, len(str(header))+3))
+    return buf.getvalue()
+
+
+st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v8 · CONCURRENT QUICK CHECK")
 st.title("Quick Check · Campaign Screening")
 st.write("Screen sanitized placement coordinates, investigate mapped building-footprint buffers, measure distances, and prepare a Google My Maps recommendation export.")
 st.warning("**Beta / preliminary only.** OSM is incomplete, and some facilities are only mapped as points or may be missing entirely; green means no intersection with the retrieved mapped facilities, **not legal clearance**. University approval and the 50-foot review band are separate review categories. No authentication: use synthetic or explicitly approved data only.")
@@ -340,18 +429,53 @@ with st.expander("1 · Upload sanitized placement inventory", expanded=True):
             id_col=c3.selectbox("Placement ID column",cols,index=cols.index(id_guess) if id_guess in cols else 0)
             feet=st.selectbox("Screening buffer",[500,250],index=0,format_func=lambda x:f"{x} feet + 50-foot review band")
             st.caption(f"{len(data):,} rows loaded. Nationwide inventory is automatically divided into local screening regions. Beta uses one screening distance per run; mixed 250/500-foot markets still require separate runs.")
-            if st.button("Run geographic screening",type="primary"):
-                st.session_state.pop("screened",None)
-                with st.spinner("Retrieving public OSM facilities and screening coordinates…"):
-                    result, facilities, n, all_geometries, epsg = screen(data,lat_col,lon_col,id_col,feet)
-                st.session_state["screened"] = result
-                st.session_state["facilities"] = facilities
-                st.session_state["source_count"] = n
-                st.session_state["buffer"] = feet
-                st.session_state["geometries"] = all_geometries
-                st.session_state["epsg"] = epsg
+            active = st.session_state.get("screening_job")
+            busy = active is not None and active.snapshot()[0] == "running"
+            if st.button("Run geographic screening", type="primary", disabled=busy):
+                st.session_state.pop("screened", None)
+                job = ScreeningJob()
+                st.session_state["running_buffer"] = feet
+                st.session_state["screening_job"] = job
+                # Independent daemon worker per session; no global job queue.
+                threading.Thread(target=run_job, args=(job, data.copy(), lat_col, lon_col, id_col, feet), daemon=True).start()
+                st.rerun()
         except Exception as exc:
             st.error(f"{type(exc).__name__}: {exc}")
+
+@st.fragment(run_every="1s")
+def job_status_panel():
+    job = st.session_state.get("screening_job")
+    if job is None:
+        return
+    status, fraction, message, values, error = job.snapshot()
+    if status == "running":
+        st.progress(fraction, text=message)
+        if st.button("■ Abort screening", type="secondary", key="abort_screening"):
+            job.cancel.set()
+            st.warning("Cancellation requested. Current OSM request may need to finish or time out.")
+    elif status == "complete" and values is not None:
+        result, facilities, n, all_geometries, epsg = values
+        st.session_state["screened"] = result
+        st.session_state["facilities"] = facilities
+        st.session_state["source_count"] = n
+        st.session_state["buffer"] = st.session_state.get("running_buffer", 500)
+        st.session_state["geometries"] = all_geometries
+        st.session_state["epsg"] = epsg
+        st.session_state.pop("screening_job", None)
+        st.rerun()
+    elif status == "failed":
+        st.error(error or message)
+        if st.button("Dismiss error", key="dismiss_job_error"):
+            st.session_state.pop("screening_job", None)
+            st.rerun()
+    elif status == "cancelled":
+        st.info(message)
+        if st.button("Start another screening", key="dismiss_cancel"):
+            st.session_state.pop("screening_job", None)
+            st.rerun()
+
+
+job_status_panel()
 
 if "screened" not in st.session_state:
     st.info("Upload a sanitized CSV/XLSX above to begin. A small example CSV is included in the downloadable project ZIP.")
@@ -375,11 +499,24 @@ show_red=mc1.checkbox("Red restricted buffers",True)
 show_yellow=mc2.checkbox("University buffers",True)
 show_sources=mc3.checkbox("Matched facility pins",True)
 show_review=mc4.checkbox("50-foot review band",False)
-st.caption("📏 Ruler: click the toolbar ruler, click a start point, move for live feet, click again to finish. Map buffers extend from mapped facility footprints, not address centers.")
+st.caption("📏 Ruler: select the measurement icon on the map, click the starting point, move and click to measure in feet; double-click to finish. Map buffers extend from mapped facility footprints, not address centers.")
 if not filtered.empty:
     center=[float(filtered["Latitude"].median()),float(filtered["Longitude"].median())]
-    m=folium.Map(location=center,zoom_start=13,tiles="CartoDB dark_matter",control_scale=True,prefer_canvas=True)
-    m.add_child(LiveRuler())
+    try:
+        carto_key = st.secrets.get("CARTO_API_KEY", "")
+    except (FileNotFoundError, KeyError):
+        carto_key = ""
+    if carto_key:
+        tile_url = "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png?key=" + quote(str(carto_key), safe="")
+        m = folium.Map(location=center, zoom_start=13, tiles=tile_url,
+                       attr="© OpenStreetMap contributors, © CARTO", control_scale=True, prefer_canvas=True)
+    else:
+        st.warning("CARTO_API_KEY not found in Streamlit Secrets. Using OpenStreetMap basemap temporarily.")
+        m = folium.Map(location=center, zoom_start=13, tiles="OpenStreetMap", control_scale=True, prefer_canvas=True)
+    # Leaflet.Measure provides working point-to-point live distance measurement.
+    plugins.MeasureControl(position="topleft", primary_length_unit="feet", secondary_length_unit="miles",
+                           primary_area_unit="sqfeet", secondary_area_unit="acres", active_color="#38bdf8",
+                           completed_color="#22c55e").add_to(m)
     clusters={}
     for status,color in [("Potential conflict","#eb4753"),("Needs more screening","#f5be38"),("University approval","#f5be38"),("No mapped hit","#3dc08f")]:
         grp=folium.FeatureGroup(name=status,show=True)
@@ -429,7 +566,7 @@ if not filtered.empty:
                 popup=f"{f['Facility Name']} · {f['Facility Category']} · {f['OSM ID']} · {f['Geometry Quality']}").add_to(source_layer)
         source_layer.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
-    st_folium(m,height=565,width=None,returned_objects=[],key="map_v7")
+    st_folium(m,height=565,width=None,returned_objects=[],key="map_v8")
     st.caption(f"Displayed {displayed} nearby mapped footprint buffers. Incomplete geometries and point-only OSM sources are not drawn as authoritative footprint polygons. Screening uses unsimplified geometries.")
 else:st.info("No placements match these filters.")
 st.caption("Green = no detected intersection with retrieved OSM sources, NOT clearance. The map is a visual investigation aid; verify OSM footprint completeness and applicable legal rules.")
@@ -448,11 +585,12 @@ recommended=result[result["Recommendation"]=="Recommend"].copy()
 st.write(f"**{len(recommended)} placements marked Recommend**. Only those placements go into the client-facing recommendation CSV.")
 export_cols=["Placement ID","Latitude","Longitude","Screening Status","Recommendation","Reviewer Notes","Matched Facility","Facility Category","Distance to Facility (ft)"]
 client=recommended[export_cols]
-files={"01_All_Screening_Results.csv":csv_bytes(result),"02_Matched_OSM_Facilities.csv":csv_bytes(facilities),"03_MyMaps_Recommended_Placements.csv":csv_bytes(client)}
+files={"01_All_Screening_Results.xlsx":excel_bytes(result), "01_All_Screening_Results.csv":csv_bytes(result),"02_Matched_OSM_Facilities.csv":csv_bytes(facilities),"03_MyMaps_Recommended_Placements.csv":csv_bytes(client)}
 archive=io.BytesIO()
 with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED) as z:
     for filename,payload in files.items():z.writestr(filename,payload)
     z.writestr("README.txt","BETA preliminary screening. Google My Maps: import 03_MyMaps_Recommended_Placements.csv as a layer; choose Latitude and Longitude; style by Screening Status. Facility reference points are in file 02. A green point is not legal clearance. No Google My Maps project is automatically created.\n")
+st.download_button("Download color-coded Excel screening results (.xlsx)", excel_bytes(result), file_name="ABI_OOH_Screening_Results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 st.download_button("Download complete review package (.zip)",archive.getvalue(),file_name="ABI_OOH_Quick_Check_Review.zip",mime="application/zip",type="primary")
 st.download_button("Download recommended placements for My Maps (.csv)",csv_bytes(client),file_name="MyMaps_Recommended_Placements.csv",mime="text/csv")
 st.caption("My Maps: import CSV → select Latitude and Longitude → choose Placement ID as title → style by Screening Status. You will still publish/share the My Maps project manually.")
