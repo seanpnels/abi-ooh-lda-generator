@@ -1,4 +1,4 @@
-"""ABI OOH LDA Quick Check v6 beta. Geometry-first screening; no authentication."""
+"""ABI OOH LDA Quick Check v7 beta. Nationwide regional screening; no authentication."""
 import io
 import math
 import re
@@ -142,7 +142,7 @@ def identify_column(cols, names):
     return None
 
 
-def screen(df, lat_col, lon_col, id_col, feet):
+def screen_region(df, lat_col, lon_col, id_col, feet):
     # Explicitly prevent common financial columns from being retained or exported.
     prohibited = re.compile(r"(^|[^a-z])(rate|cpm|cost|budget|discount|net price|gross price|spend|investment)([^a-z]|$)",re.I)
     records = df.drop(columns=[c for c in df.columns if prohibited.search(str(c))]).copy().reset_index(drop=True)
@@ -168,8 +168,6 @@ def screen(df, lat_col, lon_col, id_col, feet):
     xy = [transform(forward, Point(lon, lat)) for lat, lon in zip(records["Latitude"], records["Longitude"])]
     minx = min(p.x for p in xy); maxx = max(p.x for p in xy)
     miny = min(p.y for p in xy); maxy = max(p.y for p in xy)
-    if max(maxx-minx, maxy-miny) > 250000:
-        raise ValueError("Inventory spans over 250 km. Separate geographically distant markets so the local distance projection remains appropriate.")
     # Tile occupied placement locations rather than the entire bounding rectangle.
     # Each OSM request includes a safety halo, so a facility immediately outside
     # the tile cannot silently disappear at a tile boundary.
@@ -180,7 +178,7 @@ def screen(df, lat_col, lon_col, id_col, feet):
         cell = (math.floor(pt.x / TILE_METERS), math.floor(pt.y / TILE_METERS))
         tile_points.setdefault(cell, []).append(idx)
     if len(tile_points) > 160:
-        raise ValueError(f"This inventory requires {len(tile_points)} geographic tiles; the beta safety cap is 160. Separate distant regions into runs.")
+        raise ValueError(f"Regional screening needs {len(tile_points)} OSM tiles, above the 160-tile regional safety limit. This region needs smaller automatic subregions.")
     all_elements = {}
     failures = []
     progress = st.progress(0, text=f"Retrieving mapped facilities: 0/{len(tile_points)} tiles")
@@ -220,7 +218,7 @@ def screen(df, lat_col, lon_col, id_col, feet):
         if gm.is_empty: continue
         pt = g.representative_point()
         facilities.append({"key": f"{key[0]}/{key[1]}", "name": e.get("tags", {}).get("name", "Unnamed OSM facility"), "category": cat,
-                           "geometry": gm, "geometry_quality": quality, "lat": pt.y, "lon": pt.x})
+                           "geometry": gm, "epsg": epsg, "geometry_quality": quality, "lat": pt.y, "lon": pt.x})
     if not facilities: raise ValueError("No usable facility geometries returned. Refusing to classify placements as green.")
     # Coverage uncertainty: point/incomplete geometries are never treated as
     # authoritative red polygons. They can only trigger additional review.
@@ -263,9 +261,62 @@ def screen(df, lat_col, lon_col, id_col, feet):
     return output, pd.DataFrame(facility_rows, columns=["Facility Name","Facility Category","OSM ID","Geometry Quality","Latitude","Longitude","Affected Placement IDs"]), len(facilities), facilities, epsg
 
 
+
+def screen(df, lat_col, lon_col, id_col, feet):
+    """Screen nationwide inventories in independent local UTM regions.
+
+    Every region gets its own projection and overlapping OSM requests; never
+    project New York and Los Angeles into one distance coordinate system.
+    """
+    coords = df[[lat_col, lon_col]].copy()
+    coords[lat_col] = pd.to_numeric(coords[lat_col], errors="coerce")
+    coords[lon_col] = pd.to_numeric(coords[lon_col], errors="coerce")
+    valid = coords[lat_col].between(-90, 90) & coords[lon_col].between(-180, 180)
+    if not valid.all():
+        raise ValueError(f"{(~valid).sum()} invalid coordinates; no results generated.")
+    if len(df) > 3000:
+        raise ValueError("Beta limit: 3,000 placements per run.")
+    # UTM zone + latitude band. A single UTM projection remains locally suitable;
+    # 2-degree latitude bands prevent very long north-south campaigns from
+    # sharing one huge screening grid.
+    groups = {}
+    for i, (lat, lon) in enumerate(zip(coords[lat_col], coords[lon_col])):
+        zone = max(1, min(60, int((lon + 180) // 6) + 1))
+        band = math.floor(lat / 2)
+        groups.setdefault((lat >= 0, zone, band), []).append(i)
+    if len(groups) > 120:
+        raise ValueError(f"Inventory spans {len(groups)} regional groups, above beta's 120-group request cap. No results generated.")
+    outputs, facility_tables, source_geometries = [], [], []
+    unique_sources = set()
+    for k, (region, indices) in enumerate(sorted(groups.items()), 1):
+        st.caption(f"Screening geographic region {k}/{len(groups)} · {len(indices)} placements · UTM zone {region[1]}")
+        subset = df.iloc[indices].copy()
+        subset["__internal_row_index__"] = indices
+        output, facility_table, n, geometries, epsg = screen_region(subset, lat_col, lon_col, id_col, feet)
+        outputs.append(output)
+        facility_tables.append(facility_table)
+        source_geometries.extend(geometries)
+        unique_sources.update(f["key"] for f in geometries)
+    output = pd.concat(outputs, ignore_index=True).sort_values("__internal_row_index__").drop(columns=["__internal_row_index__"]).reset_index(drop=True)
+    if facility_tables:
+        facilities = pd.concat(facility_tables, ignore_index=True)
+        if not facilities.empty:
+            facilities = facilities.groupby("OSM ID", as_index=False).agg({
+                "Facility Name": "first", "Facility Category": "first", "Geometry Quality": "first",
+                "Latitude": "first", "Longitude": "first",
+                "Affected Placement IDs": lambda values: "; ".join(sorted(set(
+                    part.strip() for v in values for part in str(v).split(";") if part.strip())))
+            })
+    else:
+        facilities = pd.DataFrame(columns=["Facility Name","Facility Category","OSM ID","Geometry Quality","Latitude","Longitude","Affected Placement IDs"])
+    # A source can occur in adjacent groups; keep one copy for map display.
+    unique_geometries = list({f["key"]: f for f in source_geometries}.values())
+    return output, facilities, len(unique_sources), unique_geometries, None
+
+
 def csv_bytes(df): return df.to_csv(index=False).encode("utf-8-sig")
 
-st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v5")
+st.caption("ABI OOH  /  LDA COMPLIANCE HUB  /  BETA v7 · NATIONWIDE")
 st.title("Quick Check · Campaign Screening")
 st.write("Screen sanitized placement coordinates, investigate mapped building-footprint buffers, measure distances, and prepare a Google My Maps recommendation export.")
 st.warning("**Beta / preliminary only.** OSM is incomplete, and some facilities are only mapped as points or may be missing entirely; green means no intersection with the retrieved mapped facilities, **not legal clearance**. University approval and the 50-foot review band are separate review categories. No authentication: use synthetic or explicitly approved data only.")
@@ -288,7 +339,7 @@ with st.expander("1 · Upload sanitized placement inventory", expanded=True):
             lon_col=c2.selectbox("Longitude column",cols,index=cols.index(lon_guess) if lon_guess in cols else min(1,len(cols)-1))
             id_col=c3.selectbox("Placement ID column",cols,index=cols.index(id_guess) if id_guess in cols else 0)
             feet=st.selectbox("Screening buffer",[500,250],index=0,format_func=lambda x:f"{x} feet + 50-foot review band")
-            st.caption(f"{len(data):,} rows loaded. Geographic requests are automatically tiled. Beta uses one screening distance per run; split mixed-exception markets into separate uploads.")
+            st.caption(f"{len(data):,} rows loaded. Nationwide inventory is automatically divided into local screening regions. Beta uses one screening distance per run; mixed 250/500-foot markets still require separate runs.")
             if st.button("Run geographic screening",type="primary"):
                 st.session_state.pop("screened",None)
                 with st.spinner("Retrieving public OSM facilities and screening coordinates…"):
@@ -337,13 +388,10 @@ if not filtered.empty:
                   f"<br>Distance: {r['Distance to Facility (ft)']} ft<br>OSM: {r['Matched OSM ID']}")
             folium.CircleMarker([r["Latitude"],r["Longitude"]],radius=6,color="white",weight=1,fill=True,fill_color=color,fill_opacity=.95,tooltip=str(r["Placement ID"]),popup=folium.Popup(desc,max_width=350)).add_to(grp)
         grp.add_to(m)
-    # Only draw buffers around relevant sources near the displayed placements.
-    # Use projected footprint geometries (meters), not point circles.
-    projected_to_ll=Transformer.from_crs(f"EPSG:{st.session_state['epsg']}","EPSG:4326",always_xy=True).transform
+    # Render only facilities close to visible placements. Each facility's
+    # geometry stays in its OWN UTM projection; never use a national UTM zone.
     pts=[Point(float(r["Longitude"]),float(r["Latitude"])) for _,r in filtered.iterrows()]
-    ll_to_projected=Transformer.from_crs("EPSG:4326",f"EPSG:{st.session_state['epsg']}",always_xy=True).transform
-    active_pts=[transform(ll_to_projected,pt) for pt in pts]
-    search_area=unary_union(active_pts).buffer((st.session_state['buffer']+150)*.3048)
+    latlon_centers=[(p.y,p.x) for p in pts]
     red_layer=folium.FeatureGroup(name="Restricted footprint buffers",show=show_red)
     yellow_layer=folium.FeatureGroup(name="University footprint buffers",show=show_yellow)
     band_layer=folium.FeatureGroup(name="50-foot review bands",show=show_review)
@@ -351,7 +399,13 @@ if not filtered.empty:
     for f in st.session_state["geometries"]:
         if f["geometry_quality"] != "footprint": continue
         geom=f["geometry"]
-        if not geom.intersects(search_area): continue
+        if not any(abs(f["lat"]-lat)<0.16 and abs(f["lon"]-lon)<0.20 for lat,lon in latlon_centers):
+            continue
+        projected_to_ll=Transformer.from_crs(f"EPSG:{f['epsg']}","EPSG:4326",always_xy=True).transform
+        ll_to_projected=Transformer.from_crs("EPSG:4326",f"EPSG:{f['epsg']}",always_xy=True).transform
+        local_points=[transform(ll_to_projected,p) for p in pts if abs(f["lat"]-p.y)<0.16 and abs(f["lon"]-p.x)<0.20]
+        if not local_points or not any(geom.distance(p) <= (st.session_state['buffer']+150)*.3048 for p in local_points):
+            continue
         if displayed>=450:
             st.warning("Map polygon preview capped at 450 nearby facilities for performance. Screening still considered all retrieved facilities.")
             break
@@ -375,7 +429,7 @@ if not filtered.empty:
                 popup=f"{f['Facility Name']} · {f['Facility Category']} · {f['OSM ID']} · {f['Geometry Quality']}").add_to(source_layer)
         source_layer.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
-    st_folium(m,height=565,width=None,returned_objects=[],key="map_v5")
+    st_folium(m,height=565,width=None,returned_objects=[],key="map_v7")
     st.caption(f"Displayed {displayed} nearby mapped footprint buffers. Incomplete geometries and point-only OSM sources are not drawn as authoritative footprint polygons. Screening uses unsimplified geometries.")
 else:st.info("No placements match these filters.")
 st.caption("Green = no detected intersection with retrieved OSM sources, NOT clearance. The map is a visual investigation aid; verify OSM footprint completeness and applicable legal rules.")
