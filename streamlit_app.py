@@ -562,6 +562,29 @@ def placement_pin_title(row, number):
     return f'Placement {number}'
 
 
+def additional_college_pins(map_rows, facility_hits):
+    primary = {(str(row['osm_id']), float(row['facility_latitude']), float(row['facility_longitude']))
+               for _, _, row in map_rows[:1000]
+               if status_code(row['screening_status']) in ('RED', 'YELLOW')
+               and pd.notna(row['facility_latitude']) and pd.notna(row['facility_longitude'])}
+    records = []
+    for hit in facility_hits:
+        if hit['status'] != 'YELLOW' or hit['category'] != 'university':
+            continue
+        key = (str(hit['osm_id']), float(hit['latitude']), float(hit['longitude']))
+        if key in primary:
+            continue
+        primary.add(key)
+        osm_id, lat, lon = key
+        title = hit['name'].strip() or 'Unnamed OSM site'
+        records.append({
+            'position': {'lat': lat, 'lng': lon}, 'title': title,
+            'popup': f'<b>{html.escape(title)}</b><br>Possible college or university — verify.'
+                     f'<br>OSM: {html.escape(osm_id)}',
+        })
+    return records
+
+
 def dma_osm_pin_records(map_rows):
     area = unary_union(list(dma_geoms.values()))
     within_dma = prep(area)
@@ -647,7 +670,7 @@ html,body{margin:0;padding:0;height:100%;font:13px Arial,sans-serif;color:#17212
 </style></head><body>
 <div id="map"></div><div id="message" role="alert"></div>
 <script>
-let records=[],osmSites=[];
+let records=[],osmSites=[],collegePins=[];
 let componentStarted=false;
 function showError(text){const box=document.getElementById('message');box.textContent=text;box.style.display='block';}
 window.gm_authFailure=function(){showError('Google Maps rejected the key. Check Maps JavaScript API, billing and the allowed website. Keep website restrictions enabled.');};
@@ -742,6 +765,11 @@ window.initReviewMap=function(){
     facilities.push(pin);attach(pin,facility.popup);bounds.extend(facility.position);
    }
   });
+  collegePins.forEach(site=>{
+   const pin=new google.maps.Marker({position:site.position,map,title:site.title,zIndex:19,
+    icon:{path:facilityPinPath,fillColor:'#f9ab00',fillOpacity:1,strokeColor:'#fff',strokeWeight:1,scale:1}});
+   facilities.push(pin);attach(pin,site.popup);
+  });
   toolbar.querySelector('#placements').onchange=e=>placements.forEach(marker=>marker.setMap(e.target.checked?map:null));
   toolbar.querySelector('#facilities').onchange=e=>facilities.forEach(marker=>marker.setMap(e.target.checked?map:null));
   if(records.length>1){map.fitBounds(bounds,50);google.maps.event.addListenerOnce(map,'idle',()=>{if(map.getZoom()>17)map.setZoom(17);});}
@@ -758,7 +786,7 @@ window.addEventListener('message',function(event) {
  const args=event.data.args||{};
  if(!Array.isArray(args.records)||!args.records.length)return;
  if(!args.api_key){showError('Google Maps key missing.');return;}
- componentStarted=true;records=args.records;osmSites=args.osm_sites||[];
+ componentStarted=true;records=args.records;osmSites=args.osm_sites||[];collegePins=args.college_pins||[];
  const loader=document.createElement('script');
  loader.src='https://maps.googleapis.com/maps/api/js?'+new URLSearchParams({key:args.api_key,v:'quarterly',loading:'async',libraries:'geometry',callback:'initReviewMap'}).toString();
  loader.async=true;loader.onerror=()=>showError('Google Maps could not load. Check your connection or browser content blocker.');document.head.appendChild(loader);
@@ -1050,14 +1078,19 @@ with a:st.download_button('Download color-coded Excel',excel_bytes(res,st.sessio
 with b:st.download_button('Download screening CSV',res_display.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
 st.caption('Excel includes a Flagged facilities worksheet with all detected Non-Compliant / Needs Review candidates and importable coordinates. In My Maps, use Latitude/Longitude for location and Business name for the title.')
 st.subheader('Review map')
-st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each Non-Compliant / Needs Review flag. Facility pins use mapped OSM locations, not verified street addresses.')
+st.caption('Circles mark placements. Pin-shaped markers identify flagged facilities, including colleges and universities that need separate review. Facility pins use mapped OSM locations, not verified street addresses.')
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     google_key=st.secrets.get('GOOGLE_MAPS_API_KEY','').strip()
+    college_pins=additional_college_pins(map_rows,st.session_state.get('stage6_facility_hits',[]))
     osm_sites=[]
     if st.checkbox('Show OSM site pins',key='stage6_show_osm_sites'):
         with st.spinner('Loading OSM sites across the selected markets…'):
             osm_sites,unavailable=dma_osm_pin_records(map_rows)
+        college_positions={(round(pin['position']['lat'],7),round(pin['position']['lng'],7))
+                           for pin in college_pins}
+        osm_sites=[site for site in osm_sites if
+                   (round(site['position']['lat'],7),round(site['position']['lng'],7)) not in college_positions]
         if unavailable:
             st.warning('OSM site pins unavailable for: '+', '.join(unavailable))
         if google_key and osm_sites:
@@ -1067,8 +1100,8 @@ if map_rows:
     if google_key:
         st.caption('Google Maps business labels appear as you zoom in. Ruler and pin controls run within the map.')
         map_records=google_review_map_records(map_rows)
-        map_identity=hashlib.sha256((json.dumps([map_records,osm_sites],allow_nan=False)+google_key).encode()).hexdigest()[:20]
-        google_review_component()(records=map_records,osm_sites=osm_sites,api_key=google_key,
+        map_identity=hashlib.sha256((json.dumps([map_records,osm_sites,college_pins],allow_nan=False)+google_key).encode()).hexdigest()[:20]
+        google_review_component()(records=map_records,osm_sites=osm_sites,college_pins=college_pins,api_key=google_key,
                                   key='google_review_'+map_identity,default=None)
     else:
         st.info('Add GOOGLE_MAPS_API_KEY in Streamlit Secrets to use Google Maps. Showing the existing CARTO map meanwhile.')
@@ -1109,6 +1142,12 @@ if map_rows:
                     icon=folium.Icon(color=color,icon='exclamation-sign',prefix='glyphicon'),
                     tooltip='Flagged facility: '+html.escape(name),
                     popup=folium.Popup(facility_popup,max_width=350)).add_to(facility_layer)
+        for site in college_pins:
+            position=site['position']
+            folium.Marker([position['lat'],position['lng']],
+                          icon=folium.Icon(color='orange',icon='exclamation-sign',prefix='glyphicon'),
+                          tooltip=html.escape(site['title']),
+                          popup=folium.Popup(site['popup'],max_width=350)).add_to(facility_layer)
         folium.LayerControl(collapsed=False).add_to(m)
         # Explicit heights on both Leaflet and its iframe prevent a collapsed map.
         # Pan, zoom, popups and measuring stay in the browser without app reruns.
