@@ -197,28 +197,43 @@ def market_column_names(frame):
 
 
 def read_inventory_grids(files):
-    frames=[];all_columns=set()
+    frames=[];all_columns=set();skipped_sheets=[]
+    def find(frame,names):
+        return next((c for c in frame.columns if str(c).strip().lower() in names),None)
     for upload in files:
         blob=io.BytesIO(upload.getvalue())
-        frame=(pd.read_excel(blob,dtype=object) if upload.name.lower().endswith('.xlsx')
-               else pd.read_csv(blob,dtype=object,encoding='utf-8-sig'))
-        if frame.empty:raise ValueError(f'{upload.name}: empty inventory')
-        def find(names):return next((c for c in frame.columns if str(c).strip().lower() in names),None)
-        lat=find({'latitude','lat'});lon=find({'longitude','lon','lng','long'})
-        if lat is None or lon is None:raise ValueError(f'{upload.name}: Latitude and Longitude columns required')
-        frames.append((upload.name,frame,lat,lon,market_column_names(frame)))
-        all_columns.update(frame.columns)
+        if upload.name.lower().endswith('.xlsx'):
+            with pd.ExcelFile(blob) as workbook:
+                sheets=[(name,pd.read_excel(workbook,sheet_name=name,dtype=object))
+                        for name in workbook.sheet_names]
+        else:
+            sheets=[('CSV',pd.read_csv(blob,dtype=object,encoding='utf-8-sig'))]
+        for sheet_name,frame in sheets:
+            if frame.empty:
+                skipped_sheets.append(f'{upload.name} / {sheet_name} (empty)')
+                continue
+            lat=find(frame,{'latitude','lat'});lon=find(frame,{'longitude','lon','lng','long'})
+            if lat is None and lon is None:
+                skipped_sheets.append(f'{upload.name} / {sheet_name} (no coordinate columns)')
+                continue
+            if lat is None or lon is None:
+                raise ValueError(f'{upload.name} / {sheet_name}: both Latitude and Longitude columns required')
+            frames.append((upload.name,sheet_name,frame,lat,lon,market_column_names(frame)))
+            all_columns.update(frame.columns)
+    if not frames:
+        raise ValueError('No worksheets with Latitude and Longitude columns found in the uploaded grids.')
     def unique(base):
         name=base;n=2
         while name in all_columns:name=f'{base}_{n}';n+=1
         all_columns.add(name);return name
-    meta={key:unique(base) for key,base in [('file','source_grid'),('row','source_excel_row'),
-          ('lat','screening_latitude'),('lon','screening_longitude'),
+    meta={key:unique(base) for key,base in [('file','source_grid'),('sheet','source_sheet'),
+          ('row','source_excel_row'),('lat','screening_latitude'),('lon','screening_longitude'),
           ('market','source_market'),('market_column','source_market_column')]}
     combined=[];summaries=[]
-    for filename,frame,lat,lon,market_columns in frames:
+    for filename,sheet_name,frame,lat,lon,market_columns in frames:
         frame=frame.copy()
-        frame[meta['file']]=filename;frame[meta['row']]=range(2,len(frame)+2)
+        frame[meta['file']]=filename;frame[meta['sheet']]=sheet_name
+        frame[meta['row']]=range(2,len(frame)+2)
         frame[meta['lat']]=frame[lat];frame[meta['lon']]=frame[lon]
         values=[];origins=[]
         for _,row in frame.iterrows():
@@ -228,8 +243,9 @@ def read_inventory_grids(files):
             origins.append(str(column) if column is not None else '')
         frame[meta['market']]=values;frame[meta['market_column']]=origins
         combined.append(frame)
-        summaries.append({'Grid':filename,'Placements':len(frame),'Market columns':', '.join(map(str,market_columns)) or 'None found'})
-    return pd.concat(combined,ignore_index=True,sort=False),meta,summaries
+        summaries.append({'Grid':filename,'Worksheet':sheet_name,'Placements':len(frame),
+                          'Market columns':', '.join(map(str,market_columns)) or 'None found'})
+    return pd.concat(combined,ignore_index=True,sort=False),meta,summaries,skipped_sheets
 
 
 def suggest_market_dmas(values,names):
@@ -315,7 +331,7 @@ def selected_dma_geometry(repo,asset_id,token,code):
 with st.spinner('Reading your grids and detecting markets…'):
     rels = show_osm_refresh()
     try:
-        df,inventory_meta,grid_summaries=read_inventory_grids(files)
+        df,inventory_meta,grid_summaries,skipped_sheets=read_inventory_grids(files)
         lat_col=inventory_meta['lat'];lon_col=inventory_meta['lon']
     except Exception as exc:
         st.error(f'Inventory error: {exc}');st.stop()
@@ -336,9 +352,10 @@ with st.spinner('Reading your grids and detecting markets…'):
     labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
     suggested_codes,market_review=suggest_market_dmas(df[inventory_meta['market']],dma_names)
 
-st.caption(f'{len(files)} grid(s) loaded: {len(df):,} placements total. Source filenames are included in exports.')
+st.caption(f'{len(files)} file(s), {len(grid_summaries)} worksheet(s) loaded: {len(df):,} placements total. Source file and worksheet are included in exports.')
 with st.expander('Uploaded grids'):
     st.dataframe(pd.DataFrame(grid_summaries),hide_index=True)
+    if skipped_sheets: st.caption('Skipped worksheets: ' + '; '.join(skipped_sheets))
 
 MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
 *{box-sizing:border-box}html,body{margin:0;background:transparent;font:14px Arial,sans-serif;color:var(--text,#eef3f8)}
@@ -663,7 +680,7 @@ GOOGLE_REVIEW_COMPONENT_HTML=r'''<!doctype html>
 <html><head><meta charset="utf-8"><meta name="referrer" content="strict-origin-when-cross-origin">
 <style>
 html,body{margin:0;padding:0;height:100%;font:13px Arial,sans-serif;color:#17212b}
-#map{height:600px;width:100%} .toolbar{background:#fff;margin:10px;padding:10px;border-radius:5px;box-shadow:0 1px 5px #666;max-width:290px}
+#map{height:100%;width:100%} .toolbar{background:#fff;margin:10px;padding:10px;border-radius:5px;box-shadow:0 1px 5px #666;max-width:290px}
 .toolbar button{cursor:pointer;margin-right:6px;padding:5px 9px}.toolbar label{display:inline-block;margin-top:8px;margin-right:8px}
 #distance{font-weight:bold;margin-top:8px}.help{font-size:11px;margin-top:5px}
 #message{position:absolute;bottom:32px;left:12px;z-index:10;background:white;padding:10px;max-width:420px;display:none;border:1px solid #b3261e}
@@ -791,7 +808,7 @@ function sendToStreamlit(type, extra) {
 }
 window.addEventListener('message',function(event) {
  if(event.source!==window.parent || !event.data || event.data.type!=='streamlit:render')return;
- sendToStreamlit('streamlit:setFrameHeight',{height:620});
+ sendToStreamlit('streamlit:setFrameHeight',{height:700});
  if(componentStarted)return;
  const args=event.data.args||{};
  if(!Array.isArray(args.records)||!args.records.length)return;
@@ -802,7 +819,7 @@ window.addEventListener('message',function(event) {
  loader.async=true;loader.onerror=()=>showError('Google Maps could not load. Check your connection or browser content blocker.');document.head.appendChild(loader);
 });
 sendToStreamlit('streamlit:componentReady',{apiVersion:1});
-sendToStreamlit('streamlit:setFrameHeight',{height:620});
+sendToStreamlit('streamlit:setFrameHeight',{height:700});
 </script></body></html>'''
 
 
@@ -861,7 +878,7 @@ def flagged_facilities_table(facility_hits):
         record['Nearest distance (ft)']=min(record['Nearest distance (ft)'],hit['distance_ft'])
         if hit.get('applied_distance_ft') is not None:record['_rules'].add(hit['applied_distance_ft'])
         record['_rows'].add(hit['screening_row'])
-        record['_sources'].add(f"{hit['source_file']}: row {hit['source_row']}")
+        record['_sources'].add(f"{hit['source_file']} / {hit.get('source_sheet', 'CSV')}: row {hit['source_row']}")
     records=[]
     for record in grouped.values():
         rows=record.pop('_rows');sources=record.pop('_sources');rules=record.pop('_rules')
@@ -1026,6 +1043,7 @@ try:
                         'longitude':facility_lon,'status':hit_status,'category':'; '.join(facility['cats']),
                         'osm_id':facility['osm_id'],'distance_ft':round(distance/.3048,1),
                         'screening_row':screening_row,'applied_distance_ft':restriction,'source_file':str(source[inventory_meta['file']]),
+                        'source_sheet':str(source[inventory_meta['sheet']]),
                         'source_row':str(source[inventory_meta['row']])})
             if trigger:
                 d,f=trigger
@@ -1116,6 +1134,14 @@ if map_rows:
         st.caption('Google Maps business labels appear as you zoom in. Ruler and pin controls run within the map.')
         map_records=google_review_map_records(map_rows)
         map_identity=hashlib.sha256((json.dumps([map_records,osm_sites,college_pins],allow_nan=False)+google_key).encode()).hexdigest()[:20]
+        # Size the component iframe relative to the Streamlit browser viewport.
+        # iframe title is the registered custom component name.
+        st.markdown('''<style>
+        iframe[title="lda_google_review"] {
+            height: 90vh !important;
+            min-height: 500px !important;
+        }
+        </style>''', unsafe_allow_html=True)
         google_review_component()(records=map_records,osm_sites=osm_sites,college_pins=college_pins,api_key=google_key,
                                   key='google_review_'+map_identity,default=None)
     else:
